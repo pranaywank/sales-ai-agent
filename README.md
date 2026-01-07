@@ -103,6 +103,10 @@ HUBSPOT_ACCESS_TOKEN=pat-xxxxx
 # Digest Settings
 DIGEST_RECIPIENTS=user1@example.com,user2@example.com
 FROM_EMAIL=noreply@example.com
+
+# HubSpot Deal Stages to Monitor (REQUIRED)
+# Find stage IDs: HubSpot Settings → Objects → Deals → Pipelines → click stage
+TARGET_STAGES=appointmentscheduled,qualifiedtobuy,12345678
 ```
 
 ### Email Delivery (Choose One)
@@ -134,9 +138,6 @@ FIREFLIES_API_KEY=xxxxx
 ### Optional Customization
 
 ```bash
-# HubSpot deal stages to monitor (comma-separated)
-TARGET_STAGES=appointmentscheduled,qualifiedtobuy
-
 # Days since last email to consider a deal stale
 STALE_THRESHOLD_DAYS=14
 
@@ -236,13 +237,21 @@ Create Lambda function and EventBridge rule: `cron(0 9 * * ? *)`
 
 All customization is done through environment variables in your `.env` file:
 
-### Change Target Deal Stages
+### Finding HubSpot Deal Stage IDs (Required)
 
-Find your HubSpot deal stage IDs in **Settings → Objects → Deals → Pipelines**, then set:
+The `TARGET_STAGES` environment variable is **required**. To find your deal stage IDs:
+
+1. Go to **HubSpot Settings → Objects → Deals → Pipelines**
+2. Click on a pipeline to see its stages
+3. Click on a stage name - the URL will show the stage ID (e.g., `...dealstage/12345678`)
+4. Alternatively, some stages use text IDs like `appointmentscheduled` or `qualifiedtobuy`
 
 ```bash
-TARGET_STAGES=appointmentscheduled,qualifiedtobuy,presentationscheduled
+# Example with numeric and text stage IDs
+TARGET_STAGES=1930059496,appointmentscheduled,qualifiedtobuy,1647352507
 ```
+
+> **Tip**: You can also find stage IDs by inspecting the network requests in your browser's developer tools when viewing deals in HubSpot.
 
 ### Change Stale Threshold
 

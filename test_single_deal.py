@@ -30,21 +30,18 @@ HUBSPOT_BASE_URL = "https://api.hubapi.com"
 # Default test deal - change this or pass as command line argument
 TEST_DEAL_NAME = os.getenv("TEST_DEAL_NAME", "Test Deal")
 
-# Deal stages to monitor (comma-separated in env var, or use defaults)
-DEFAULT_STAGES = "appointmentscheduled,qualifiedtobuy"
+# Deal stages to monitor (comma-separated in env var, REQUIRED)
 TARGET_STAGES = [
     stage.strip() 
-    for stage in os.getenv("TARGET_STAGES", DEFAULT_STAGES).split(",") 
+    for stage in os.getenv("TARGET_STAGES", "").split(",") 
     if stage.strip()
 ]
-
-# Stage labels for display (customize as needed)
-STAGE_LABELS = {
-    "appointmentscheduled": "Demo",
-    "qualifiedtobuy": "Potential Fit",
-    "presentationscheduled": "Presentation",
-    "decisionmakerboughtin": "Decision Maker Bought-In",
-}
+if not TARGET_STAGES:
+    raise ValueError(
+        "TARGET_STAGES environment variable is required.\n"
+        "Set it to a comma-separated list of HubSpot deal stage IDs.\n"
+        "Find stage IDs in HubSpot: Settings → Objects → Deals → Pipelines → click on a stage to see its ID."
+    )
 
 # Slack channels to search for internal context (comma-separated in env var)
 DEFAULT_SLACK_CHANNELS = "sales,marketing"
@@ -716,7 +713,7 @@ def main():
     deal_id = deal["id"]
     actual_deal_name = deal["properties"].get("dealname", "Unknown Deal")
     stage = deal["properties"].get("dealstage", "")
-    stage_label = STAGE_LABELS.get(stage, stage)
+    stage_label = stage  # Use stage ID as label
     
     print(f"   ✓ Found: {actual_deal_name} (ID: {deal_id})")
     print(f"   Stage: {stage_label}")

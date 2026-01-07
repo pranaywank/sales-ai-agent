@@ -20,12 +20,13 @@ Environment Variables Required:
     SENDGRID_API_KEY - Your SendGrid API key (or use SMTP settings)
     DIGEST_RECIPIENTS - Comma-separated list of email addresses for the digest
     FROM_EMAIL - Sender email address for the digest
+    TARGET_STAGES - Comma-separated list of HubSpot deal stage IDs to monitor
+                    (Find IDs: HubSpot Settings → Objects → Deals → Pipelines)
 
 Optional Environment Variables:
     SLACK_BOT_TOKEN - Slack Bot OAuth token for searching internal discussions
     SLACK_CHANNELS - Comma-separated list of Slack channels to search (default: sales,marketing)
     FIREFLIES_API_KEY - Fireflies.ai API key for searching call transcripts
-    TARGET_STAGES - Comma-separated list of HubSpot deal stage IDs to monitor
     STALE_THRESHOLD_DAYS - Days since last email to consider a deal stale (default: 14)
     SMTP_HOST - SMTP server host (if not using SendGrid)
     SMTP_PORT - SMTP server port
@@ -59,21 +60,18 @@ if not DIGEST_RECIPIENTS:
 # Sender email for digest
 FROM_EMAIL = os.getenv("FROM_EMAIL", "noreply@example.com")
 
-# Deal stages to monitor (comma-separated in env var, or use defaults)
-DEFAULT_STAGES = "appointmentscheduled,qualifiedtobuy"
+# Deal stages to monitor (comma-separated in env var, REQUIRED)
 TARGET_STAGES = [
     stage.strip() 
-    for stage in os.getenv("TARGET_STAGES", DEFAULT_STAGES).split(",") 
+    for stage in os.getenv("TARGET_STAGES", "").split(",") 
     if stage.strip()
 ]
-
-# Stage labels for display (customize as needed)
-STAGE_LABELS = {
-    "appointmentscheduled": "Demo",
-    "qualifiedtobuy": "Potential Fit",
-    "presentationscheduled": "Presentation",
-    "decisionmakerboughtin": "Decision Maker Bought-In",
-}
+if not TARGET_STAGES:
+    raise ValueError(
+        "TARGET_STAGES environment variable is required.\n"
+        "Set it to a comma-separated list of HubSpot deal stage IDs.\n"
+        "Find stage IDs in HubSpot: Settings → Objects → Deals → Pipelines → click on a stage to see its ID."
+    )
 
 # Days threshold for stale deals
 STALE_THRESHOLD_DAYS = int(os.getenv("STALE_THRESHOLD_DAYS", "14"))
@@ -1050,7 +1048,7 @@ def main():
         print("ℹ️ Fireflies integration disabled (FIREFLIES_API_KEY not set)")
     
     # Step 1: Get deals in target stages
-    print(f"\n📊 Fetching deals in stages: {', '.join(STAGE_LABELS.values())}")
+    print(f"\n📊 Fetching deals in stages: {', '.join(TARGET_STAGES)}")
     
     deals = hubspot.search_deals(
         stages=TARGET_STAGES,
@@ -1067,7 +1065,7 @@ def main():
         deal_id = deal["id"]
         deal_name = deal["properties"].get("dealname", "Unknown Deal")
         stage = deal["properties"].get("dealstage", "")
-        stage_label = STAGE_LABELS.get(stage, stage)
+        stage_label = stage  # Use stage ID as label
         
         print(f"\n🔍 Checking: {deal_name} ({stage_label})")
         
