@@ -139,52 +139,94 @@ class HubSpotClient:
         
         return company_response.json()
     
-    def get_deal_emails(self, deal_id: str, limit: int = 10) -> list[dict]:
-        """Get emails associated with a deal."""
-        url = f"{HUBSPOT_BASE_URL}/crm/v3/objects/deals/{deal_id}/associations/emails"
+    def get_deal_emails(self, deal_id: str, limit: int = 50) -> list[dict]:
+        """Get emails associated with a deal.
         
-        response = requests.get(url, headers=self.headers)
-        response.raise_for_status()
-        
-        associations = response.json().get("results", [])
-        if not associations:
-            return []
-        
-        email_ids = [a.get("toObjectId") or a.get("id") for a in associations[:limit]]
-        
-        return self._fetch_emails_by_ids(email_ids)
+        Fetches all email associations (with pagination) and returns the most recent ones.
+        """
+        return self._get_object_emails("deals", deal_id, limit)
     
-    def get_company_emails(self, company_id: str, limit: int = 10) -> list[dict]:
-        """Get emails associated with a company."""
-        url = f"{HUBSPOT_BASE_URL}/crm/v3/objects/companies/{company_id}/associations/emails"
+    def get_company_emails(self, company_id: str, limit: int = 50) -> list[dict]:
+        """Get emails associated with a company.
         
-        response = requests.get(url, headers=self.headers)
-        response.raise_for_status()
+        Fetches all email associations (with pagination) and returns the most recent ones.
+        """
+        return self._get_object_emails("companies", company_id, limit)
+    
+    def _get_object_emails(self, object_type: str, object_id: str, limit: int = 50) -> list[dict]:
+        """Get emails associated with any CRM object, with pagination support."""
+        all_email_ids = []
+        url = f"{HUBSPOT_BASE_URL}/crm/v3/objects/{object_type}/{object_id}/associations/emails"
         
-        associations = response.json().get("results", [])
-        if not associations:
+        # Paginate through all associations
+        while url:
+            response = requests.get(url, headers=self.headers)
+            response.raise_for_status()
+            
+            data = response.json()
+            associations = data.get("results", [])
+            
+            for a in associations:
+                email_id = a.get("toObjectId") or a.get("id")
+                if email_id:
+                    all_email_ids.append(email_id)
+            
+            # Check for next page
+            paging = data.get("paging", {})
+            next_link = paging.get("next", {}).get("link")
+            url = next_link if next_link else None
+        
+        if not all_email_ids:
             return []
         
-        email_ids = [a.get("toObjectId") or a.get("id") for a in associations[:limit]]
+        # Fetch all emails and sort by date to get most recent
+        emails = self._fetch_emails_by_ids(all_email_ids)
         
-        return self._fetch_emails_by_ids(email_ids)
+        # Sort by timestamp (most recent first) and return limited results
+        def get_email_timestamp(email):
+            props = email.get("properties", {})
+            ts = props.get("hs_timestamp") or props.get("hs_createdate") or "0"
+            if isinstance(ts, str):
+                try:
+                    return datetime.fromisoformat(ts.replace("Z", "+00:00")).timestamp()
+                except ValueError:
+                    return 0
+            return ts / 1000 if ts else 0
+        
+        emails.sort(key=get_email_timestamp, reverse=True)
+        return emails[:limit]
     
     def _fetch_emails_by_ids(self, email_ids: list[str]) -> list[dict]:
-        """Fetch email details by IDs."""
+        """Fetch email details by IDs.
+        
+        Handles batching for large numbers of emails (HubSpot limit is 100 per batch).
+        """
         if not email_ids:
             return []
         
+        # Deduplicate email IDs
+        unique_ids = list(set(email_ids))
+        
+        all_emails = []
         emails_url = f"{HUBSPOT_BASE_URL}/crm/v3/objects/emails/batch/read"
-        emails_payload = {
-            "inputs": [{"id": eid} for eid in email_ids],
-            "properties": ["hs_email_subject", "hs_email_status", "hs_email_direction",
-                          "hs_timestamp", "hs_email_text", "hs_createdate"]
-        }
         
-        emails_response = requests.post(emails_url, headers=self.headers, json=emails_payload)
-        emails_response.raise_for_status()
+        # Process in batches of 100 (HubSpot limit)
+        batch_size = 100
+        for i in range(0, len(unique_ids), batch_size):
+            batch_ids = unique_ids[i:i + batch_size]
+            
+            emails_payload = {
+                "inputs": [{"id": eid} for eid in batch_ids],
+                "properties": ["hs_email_subject", "hs_email_status", "hs_email_direction",
+                              "hs_timestamp", "hs_email_text", "hs_createdate"]
+            }
+            
+            emails_response = requests.post(emails_url, headers=self.headers, json=emails_payload)
+            emails_response.raise_for_status()
+            
+            all_emails.extend(emails_response.json().get("results", []))
         
-        return emails_response.json().get("results", [])
+        return all_emails
     
     def get_deal_notes(self, deal_id: str, limit: int = 5) -> list[dict]:
         """Get notes associated with a deal."""
@@ -381,16 +423,34 @@ class FirefliesClient:
         return "\n".join(formatted_transcripts)
 
 
-def get_last_sent_email_date(emails: list[dict]) -> Optional[datetime]:
-    """Extract the most recent SENT email date from a list of emails."""
+def get_last_sent_email_date(emails: list[dict], verbose: bool = False) -> Optional[datetime]:
+    """Extract the most recent SENT email date from a list of emails.
+    
+    Checks multiple HubSpot email properties to identify outbound emails:
+    - hs_email_status: SENT
+    - hs_email_direction: EMAIL (outbound) vs INCOMING_EMAIL (inbound)
+    """
     sent_emails = []
     
     for email in emails:
         props = email.get("properties", {})
         status = props.get("hs_email_status", "")
         direction = props.get("hs_email_direction", "")
+        subject = props.get("hs_email_subject", "")[:50] if props.get("hs_email_subject") else "No subject"
         
-        if status == "SENT" or direction == "EMAIL":
+        # Look for outbound sent emails
+        # HubSpot uses "EMAIL" for outbound and "INCOMING_EMAIL" for inbound
+        is_sent = (
+            status == "SENT" or 
+            direction == "EMAIL" or 
+            direction == "OUTGOING_EMAIL" or
+            (status and status != "BOUNCED" and direction != "INCOMING_EMAIL")
+        )
+        
+        if verbose:
+            print(f"      📧 [{status}/{direction}] {subject}")
+        
+        if is_sent:
             timestamp = props.get("hs_timestamp") or props.get("hs_createdate")
             if timestamp:
                 try:
@@ -661,19 +721,40 @@ def main():
     print(f"   ✓ Found: {actual_deal_name} (ID: {deal_id})")
     print(f"   Stage: {stage_label}")
     
-    # Get emails
-    print(f"\n📧 Fetching emails...")
-    deal_emails = hubspot.get_deal_emails(deal_id)
-    last_deal_email_date = get_last_sent_email_date(deal_emails)
-    
+    # Get company first (needed for company email check)
+    print(f"\n🏢 Fetching company...")
     company = hubspot.get_associated_company(deal_id)
     company_id = company.get("id") if company else None
+    company_name = company.get("properties", {}).get("name", "Unknown") if company else "Unknown"
+    print(f"   Company: {company_name} (ID: {company_id})")
     
+    # Get emails from deal
+    print(f"\n📧 Fetching emails...")
+    deal_emails = hubspot.get_deal_emails(deal_id)
+    print(f"   📁 Deal emails found: {len(deal_emails)}")
+    last_deal_email_date = get_last_sent_email_date(deal_emails, verbose=True)
+    
+    # Get emails from company (account) object
     company_emails = []
     last_company_email_date = None
     if company_id:
         company_emails = hubspot.get_company_emails(company_id)
-        last_company_email_date = get_last_sent_email_date(company_emails)
+        print(f"   🏢 Company emails found: {len(company_emails)}")
+        last_company_email_date = get_last_sent_email_date(company_emails, verbose=True)
+    else:
+        print(f"   ⚠️ No company associated with this deal")
+    
+    # Deduplicate emails (same email might be associated with both deal and company)
+    seen_email_ids = set()
+    unique_emails = []
+    for email in deal_emails + company_emails:
+        email_id = email.get("id")
+        if email_id and email_id not in seen_email_ids:
+            seen_email_ids.add(email_id)
+            unique_emails.append(email)
+    
+    if len(unique_emails) != len(deal_emails) + len(company_emails):
+        print(f"   📊 After deduplication: {len(unique_emails)} unique emails")
     
     # Determine most recent email
     last_email_date = None
@@ -693,14 +774,14 @@ def main():
         last_email_date = last_company_email_date
         email_source = "company"
     
-    emails = deal_emails + company_emails
+    emails = unique_emails
     
     if last_email_date:
         days_ago = (datetime.now(last_email_date.tzinfo) - last_email_date).days
-        print(f"   Last email: {days_ago} days ago (from {email_source})")
+        print(f"   ✉️ Last sent email: {days_ago} days ago (from {email_source})")
     else:
         days_ago = 999
-        print(f"   No sent emails found")
+        print(f"   ❌ No sent emails found (checked deal and company)")
     
     # Get contacts and notes
     print(f"\n👤 Fetching contacts and notes...")
