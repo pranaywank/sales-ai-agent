@@ -48,6 +48,10 @@ load_dotenv()
 # Configuration
 HUBSPOT_BASE_URL = "https://api.hubapi.com"
 
+# Knowledge base paths
+CHROMA_PERSIST_DIR = os.path.join(os.path.dirname(__file__), ".chroma")
+COLLECTION_NAME = "adopt_ai_knowledge"
+
 # Digest recipients (comma-separated in env var)
 DIGEST_RECIPIENTS = [
     email.strip() 
@@ -548,6 +552,133 @@ class FirefliesClient:
         return "\n".join(formatted_transcripts)
 
 
+class KnowledgeBaseClient:
+    """Client for querying the Adopt AI knowledge base via ChromaDB."""
+    
+    def __init__(self):
+        self.client = None
+        self.collection = None
+        self._initialized = False
+        
+    def initialize(self) -> bool:
+        """Initialize ChromaDB connection. Returns True if successful."""
+        if self._initialized:
+            return True
+            
+        try:
+            import chromadb
+            
+            if not os.path.exists(CHROMA_PERSIST_DIR):
+                print("   ⚠️ Knowledge base not found. Run 'python index_knowledge_base.py' first.")
+                return False
+            
+            self.client = chromadb.PersistentClient(path=CHROMA_PERSIST_DIR)
+            self.collection = self.client.get_collection(COLLECTION_NAME)
+            self._initialized = True
+            return True
+            
+        except ImportError:
+            print("   ⚠️ ChromaDB not installed. Run 'pip install chromadb'")
+            return False
+        except ValueError as e:
+            print(f"   ⚠️ Knowledge base collection not found: {e}")
+            print("   Run 'python index_knowledge_base.py' to create it.")
+            return False
+        except Exception as e:
+            print(f"   ⚠️ Error initializing knowledge base: {e}")
+            return False
+    
+    def search(self, query: str, n_results: int = 5) -> list[dict]:
+        """Search the knowledge base for relevant content."""
+        if not self._initialized and not self.initialize():
+            return []
+        
+        try:
+            results = self.collection.query(
+                query_texts=[query],
+                n_results=n_results
+            )
+            
+            if not results["documents"] or not results["documents"][0]:
+                return []
+            
+            formatted_results = []
+            for doc, meta in zip(results["documents"][0], results["metadatas"][0]):
+                formatted_results.append({
+                    "content": doc,
+                    "source": meta.get("source", "unknown"),
+                    "category": meta.get("category", "general"),
+                })
+            
+            return formatted_results
+            
+        except Exception as e:
+            print(f"   ⚠️ Knowledge base search error: {e}")
+            return []
+    
+    def get_context_for_deal(self, deal_context: dict) -> str:
+        """Build a comprehensive knowledge base context for a specific deal.
+        
+        Searches for:
+        1. Industry-specific use cases and capabilities
+        2. Persona-relevant messaging (based on job title)
+        3. Company size-appropriate value propositions
+        """
+        if not self._initialized and not self.initialize():
+            return "Knowledge base not available."
+        
+        all_results = []
+        
+        # Search by industry
+        industry = deal_context.get("company_industry", "")
+        if industry and industry != "Unknown":
+            results = self.search(f"{industry} industry use case capabilities", n_results=3)
+            all_results.extend(results)
+        
+        # Search by job title/persona
+        job_title = deal_context.get("contact_title", "")
+        if job_title and job_title != "Unknown":
+            results = self.search(f"{job_title} persona messaging value proposition", n_results=3)
+            all_results.extend(results)
+        
+        # Search based on notes/context for specific problems
+        notes = deal_context.get("notes", "")
+        if notes and notes != "No notes available":
+            # Extract key terms from notes
+            results = self.search(f"solution for {notes[:200]}", n_results=2)
+            all_results.extend(results)
+        
+        # General capabilities search
+        results = self.search("Adopt AI capabilities features platform", n_results=2)
+        all_results.extend(results)
+        
+        # Deduplicate and format
+        seen_content = set()
+        unique_results = []
+        for r in all_results:
+            content_hash = hash(r["content"][:100])
+            if content_hash not in seen_content:
+                seen_content.add(content_hash)
+                unique_results.append(r)
+        
+        return self.format_kb_context(unique_results[:8])
+    
+    def format_kb_context(self, results: list[dict]) -> str:
+        """Format knowledge base results into a context string for the prompt."""
+        if not results:
+            return "No relevant knowledge base content found."
+        
+        formatted = []
+        for r in results:
+            source = r.get("source", "unknown")
+            category = r.get("category", "general")
+            content = r.get("content", "")[:800]
+            
+            formatted.append(f"[{category}/{source}]\n{content}")
+        
+        return "\n\n---\n\n".join(formatted)
+
+
 def get_last_sent_email_date(emails: list[dict], verbose: bool = False) -> Optional[datetime]:
     """Extract the most recent SENT email date from a list of emails.
     
@@ -709,17 +840,11 @@ You are an AI sales assistant for Adopt AI, specializing in generating personali
 **Recent Company News & Intelligence (from web search):**
 {deal_context.get('web_research', 'No web research available.')}
 
-## Current Adopt AI Capabilities to Reference
+## Adopt AI Knowledge Base (Relevant Context)
 
-When identifying what's changed or what we can now offer, reference these capabilities:
+The following content was retrieved from our knowledge base based on this deal's industry, persona, and context. Use this to craft a more personalized and relevant email:
 
-- **ZAPI (Zero-Shot API Ingestion)**: Automated API discovery in 24 hours
-- **Agent Builder**: No-code action creation and testing
-- **Multiple Deployment Options**: SDK, API Wrapper, MCP Server
-- **Dashboard & Analytics**: Full observability and performance monitoring
-- **Custom Themes & Branding**: White-label agent experiences
-- **Enterprise Security**: CSP support, on-prem deployment via Helm
-- **Playground Profiles**: Multi-environment testing (staging, prod, sandbox)
+{deal_context.get('knowledge_base_context', 'No knowledge base content available.')}
 
 ## Your Task
 
@@ -1047,6 +1172,14 @@ def main():
     else:
         print("ℹ️ Fireflies integration disabled (FIREFLIES_API_KEY not set)")
     
+    # Initialize knowledge base client
+    knowledge_base = KnowledgeBaseClient()
+    if knowledge_base.initialize():
+        print(f"📚 Knowledge base enabled ({knowledge_base.collection.count()} chunks indexed)")
+    else:
+        print("ℹ️ Knowledge base disabled (run 'python index_knowledge_base.py' to enable)")
+        knowledge_base = None
+    
     # Step 1: Get deals in target stages
     print(f"\n📊 Fetching deals in stages: {', '.join(TARGET_STAGES)}")
     
@@ -1239,6 +1372,18 @@ def main():
             "fireflies_context": fireflies_context,
             "web_research": web_research,
         }
+        
+        # Knowledge base context (RAG)
+        kb_context = "Knowledge base not available."
+        if knowledge_base:
+            print(f"   📚 Searching knowledge base...")
+            kb_context = knowledge_base.get_context_for_deal(deal_context)
+            if kb_context and "No relevant" not in kb_context and "not available" not in kb_context:
+                print(f"   ✓ Found relevant knowledge base content")
+            else:
+                print(f"   ℹ️ No specific knowledge base matches")
+        
+        deal_context["knowledge_base_context"] = kb_context
         
         stale_deals.append(deal_context)
     

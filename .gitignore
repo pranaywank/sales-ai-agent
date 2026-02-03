@@ -42,3 +42,11 @@ Thumbs.db
 # Logs
 *.log
 
+# ChromaDB vector database
+.chroma/
+
+# Knowledge base documents and generated outputs
+docs/
+
+# Temporary files
+tmp/
