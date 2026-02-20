@@ -66,7 +66,8 @@ LEAD_FINDER_RECIPIENTS = [
     if email.strip()
 ]
 if not LEAD_FINDER_RECIPIENTS:
-    raise ValueError("LEAD_FINDER_RECIPIENTS environment variable is required (comma-separated emails)")
+    import logging as _logging
+    _logging.warning("LEAD_FINDER_RECIPIENTS not set — digest email will not be sent. Set this env var for full operation.")
 
 # Sender email for digest
 FROM_EMAIL = os.getenv("FROM_EMAIL", "noreply@example.com")
