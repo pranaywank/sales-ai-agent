@@ -138,42 +138,92 @@ class ZohoClient:
         result = response.json().get("data", [])[0]
         return result.get("code") == "SUCCESS"
 
-    def get_emails(self, lead_id: str) -> List[Dict[str, Any]]:
-        """Fetch emails associated with a lead."""
-        # Using v3 as v2/v2.1 might be deprecated or behave differently for Emails data
-        url = f"{self.api_domain}/crm/v3/Leads/{lead_id}/Emails"
-        params = {"sort_by": "Message_Time", "sort_order": "desc", "per_page": 20}
-        
-        response = requests.get(url, headers=self._get_headers(), params=params)
-        
-        if response.status_code == 204:
-            return []
-            
-        try:
-             response.raise_for_status()
-             return response.json().get("Emails", [])
-        except Exception as e:
-             # Print error for debugging
-             print(f"DEBUG: Error fetching emails for {lead_id}: {e}")
-             if response.content:
-                 print(f"DEBUG: Response Content: {response.content}")
-             return []
+    def _extract_email_rows(self, payload: Dict[str, Any]) -> List[Dict[str, Any]]:
+        """
+        Zoho email APIs can return different keys by endpoint/region/version.
+        Normalize both to a list of email rows.
+        """
+        rows = payload.get("Emails")
+        if isinstance(rows, list):
+            return rows
+        rows = payload.get("email_related_list")
+        if isinstance(rows, list):
+            return rows
+        rows = payload.get("data")
+        if isinstance(rows, list):
+            return rows
+        return []
 
-    def get_email_content(self, lead_id: str, message_id: str) -> str:
-        """Fetch the full content of a specific email."""
-        # Using v3
+    def get_emails(self, lead_id: str, limit: int = 20) -> List[Dict[str, Any]]:
+        """
+        Fetch emails associated with a lead.
+        Paginates using Zoho's index cursor when available.
+        """
+        url = f"{self.api_domain}/crm/v3/Leads/{lead_id}/Emails"
+        next_index: Optional[str] = None
+        collected: List[Dict[str, Any]] = []
+
+        while len(collected) < max(limit, 1):
+            params: Dict[str, Any] = {
+                "sort_by": "Message_Time",
+                "sort_order": "desc",
+                "per_page": min(200, max(limit, 10)),
+            }
+            if next_index:
+                params["index"] = next_index
+
+            response = requests.get(url, headers=self._get_headers(), params=params)
+            if response.status_code == 204:
+                break
+
+            try:
+                response.raise_for_status()
+                payload = response.json()
+                rows = self._extract_email_rows(payload)
+                if not rows:
+                    break
+                collected.extend(rows)
+
+                info = payload.get("info", {}) if isinstance(payload, dict) else {}
+                more_records = bool(info.get("more_records"))
+                next_index = info.get("next_index")
+                if not more_records or not next_index:
+                    break
+            except Exception as e:
+                print(f"DEBUG: Error fetching emails for {lead_id}: {e}")
+                if response.content:
+                    print(f"DEBUG: Response Content: {response.content}")
+                break
+
+        return collected[:limit]
+
+    def get_email_content(self, lead_id: str, message_id: str, owner_id: Optional[str] = None) -> str:
+        """
+        Fetch full content for a specific email.
+        For shared mailboxes, Zoho may require user_id (owner id) on this endpoint.
+        """
         url = f"{self.api_domain}/crm/v3/Leads/{lead_id}/Emails/{message_id}"
-        
-        try:
-            response = requests.get(url, headers=self._get_headers())
-            response.raise_for_status()
-            data = response.json().get("Emails", [])
-            if data and isinstance(data, list):
-                return data[0].get("content", "")
-            return ""
-        except Exception as e:
-            print(f"DEBUG: Error fetching email content for {message_id}: {e}")
-            return ""
+        user_ids_to_try: List[Optional[str]] = [None]
+        if owner_id:
+            user_ids_to_try.append(owner_id)
+
+        last_error = None
+        for user_id in user_ids_to_try:
+            params = {"user_id": user_id} if user_id else None
+            try:
+                response = requests.get(url, headers=self._get_headers(), params=params)
+                response.raise_for_status()
+                rows = self._extract_email_rows(response.json())
+                if rows and isinstance(rows[0], dict):
+                    return rows[0].get("content", "") or ""
+                return ""
+            except Exception as e:
+                last_error = e
+                if hasattr(e, "response") and e.response is not None and e.response.content:
+                    print(f"DEBUG: View email error ({message_id}, user_id={user_id}): {e.response.content}")
+
+        print(f"DEBUG: Error fetching email content for {message_id}: {last_error}")
+        return ""
 
     def update_lead(self, lead_id: str, data: Dict[str, Any]) -> bool:
         """Update a lead's fields."""
@@ -192,4 +242,3 @@ class ZohoClient:
             print(f"DEBUG: Zoho Update Error Response: {result}")
             
         return result.get("code") == "SUCCESS"
-

@@ -37,6 +37,7 @@ ZOHO_REFRESH_TOKEN = os.getenv("ZOHO_REFRESH_TOKEN")
 ZOHO_API_DOMAIN = os.getenv("ZOHO_API_DOMAIN", "https://www.zohoapis.com")
 
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
+ANTHROPIC_MODEL = os.getenv("ANTHROPIC_MODEL", "claude-haiku-4-5-20251001")
 
 GOOGLE_REFRESH_TOKEN = os.getenv("GOOGLE_REFRESH_TOKEN")
 GOOGLE_CLIENT_ID = os.getenv("GOOGLE_CLIENT_ID")
@@ -207,7 +208,7 @@ class ZohoAgentCore:
         Fetches emails using V3 API, sorts by time, and fetches full content for top emails.
         Returns sorted list of email dicts with 'full_content', '_clean_content', and '_direction' populated.
         """
-        emails = self.zoho.get_emails(lead_id)
+        emails = self.zoho.get_emails(lead_id, limit=max(limit, 20))
         if not emails:
             return []
 
@@ -224,13 +225,14 @@ class ZohoAgentCore:
             # Populate content if missing
             content = e.get('content') or e.get('summary') or ""
             msg_id = e.get('message_id') or e.get('id')
+            owner_id = str((e.get("owner") or {}).get("id") or "").strip() or None
             
             # Decide if we need to fetch full content
             # If content is empty or looks like a snippet
             if (not content or len(str(content)) < 50) and msg_id:
                 # Fetch full content
                 # print(f"DEBUG: Fetching full content for email {msg_id}...")
-                full = self.zoho.get_email_content(lead_id, msg_id)
+                full = self.zoho.get_email_content(lead_id, msg_id, owner_id=owner_id)
                 if full:
                     e['full_content'] = full
                     e['content'] = full # Update main field too
@@ -279,6 +281,8 @@ class ZohoAgentCore:
         try:
             emails = self.get_enriched_emails(lead_id, limit=5)
             latest_incoming = None
+            latest_sent = None
+            latest_email = None
             days_since_reply = 999
             
             if emails:
@@ -288,8 +292,11 @@ class ZohoAgentCore:
                 for i, e in enumerate(emails[:5]):
                     print(f"DEBUG: Email {i}: [{e.get('_direction')}] | Time: {e.get('_sort_time')[:19]} | Subj: {e.get('subject', 'No Subject')}")
                 
+                latest_email = emails[0]
                 # Find the most recent RECEIVED email
                 latest_incoming = next((e for e in emails if e.get('_direction') == 'RECEIVED'), None)
+                # Find the most recent SENT email
+                latest_sent = next((e for e in emails if e.get('_direction') == 'SENT'), None)
                 
                 if latest_incoming:
                     msg_time = latest_incoming.get('_sort_time', '')[:10]
@@ -305,7 +312,8 @@ class ZohoAgentCore:
                     print("DEBUG: No incoming emails found from lead in recent history.")
             
             # Logic Branches
-            if latest_incoming and days_since_reply <= 7:
+            # ACTIVE only if the latest email in thread is from the lead (unanswered incoming).
+            if latest_incoming and days_since_reply <= 7 and latest_email and latest_email.get('_direction') == 'RECEIVED':
                 # ACTIVE: Lead replied recently
                 print(f"\nDEBUG: *** EMAIL TYPE: ACTIVE RESPONSE ***")
                 
@@ -321,6 +329,18 @@ class ZohoAgentCore:
                     "last_reply_date": latest_incoming.get("_sort_time", "")[:10],
                     "last_reply_body": reply_content,
                     "last_reply_subject": latest_incoming.get("subject", "")
+                }
+                return plan
+            elif latest_email and latest_email.get('_direction') == 'SENT' and latest_incoming:
+                # We already replied after the lead's latest message; next action should be follow-up, not active-response.
+                print(f"\nDEBUG: *** EMAIL TYPE: FOLLOW-UP (awaiting response to our latest sent email) ***")
+                plan["type"] = "email"
+                plan["template"] = "day_2_followup_pending_question"
+                plan["reason"] = "Latest thread activity is our sent email with pending clarification request"
+                latest_sent_body = latest_email.get("_clean_content") or latest_email.get("summary") or ""
+                plan["context"] = {
+                    "latest_sent_subject": latest_email.get("subject", ""),
+                    "latest_sent_body": latest_sent_body[:1200]
                 }
                 return plan
                 
@@ -408,7 +428,7 @@ class ZohoAgentCore:
 
         print(f"   Fetching context for {name}...")
         notes = self.zoho.get_notes(lead_id)
-        emails = self.zoho.get_emails(lead_id)
+        emails = self.zoho.get_emails(lead_id, limit=20)
         
         # Get FULL content
         notes_text = ""
@@ -419,9 +439,12 @@ class ZohoAgentCore:
         latest_email_context = "None"
         
         if emails:
-            # Sort by sent_time descending (correct lowercase field name from Zoho API)
+            # Sort by best-available timestamp descending.
             try:
-                emails.sort(key=lambda x: x.get('sent_time', ''), reverse=True)
+                emails.sort(
+                    key=lambda x: x.get("time") or x.get("sent_time") or x.get("Message_Time") or "",
+                    reverse=True
+                )
             except:
                 pass
                 
@@ -433,18 +456,19 @@ class ZohoAgentCore:
             if emails:
                 latest_email = emails[0]
                 l_id = latest_email.get("message_id")  # Correct field name from Zoho list API
+                l_owner_id = str((latest_email.get("owner") or {}).get("id") or "").strip() or None
                 l_is_sent = latest_email.get("sent", True)
                 l_sender = "AGENT" if l_is_sent else "LEAD"
                 print(f"DEBUG: Fetching content for LATEST email: {latest_email.get('subject')} ({l_id}) | From: {l_sender}")
                 
                 l_content = ""
                 if l_id:
-                    l_content = self.zoho.get_email_content(lead_id, l_id)
+                    l_content = self.zoho.get_email_content(lead_id, l_id, owner_id=l_owner_id)
                 if not l_content:
                     l_content = latest_email.get("summary") or "No content found"
                 
                 latest_email_context = f"""
-                [{latest_email.get('sent_time', '')[:10]}] {l_sender}: {latest_email.get('subject')}
+                [{(latest_email.get('time') or latest_email.get('sent_time') or '')[:10]}] {l_sender}: {latest_email.get('subject')}
                 BODY:
                 {l_content[:1500]}
                 """
@@ -453,7 +477,8 @@ class ZohoAgentCore:
             for e in recent_emails:
                 e_id = e.get("message_id")  # Correct field name
                 e_subj = e.get("subject", "No Subject")
-                e_time = e.get("sent_time", "")[:10]
+                e_time = (e.get("time") or e.get("sent_time") or "")[:10]
+                e_owner_id = str((e.get("owner") or {}).get("id") or "").strip() or None
                 e_is_sent = e.get("sent", True)
                 e_dir = "AGENT" if e_is_sent else "LEAD"
                 
@@ -466,7 +491,7 @@ class ZohoAgentCore:
                 e_content = "Content not available"
                 try:
                     if e_id:
-                        e_content = self.zoho.get_email_content(lead.get("id"), e_id) or "No content"
+                        e_content = self.zoho.get_email_content(lead.get("id"), e_id, owner_id=e_owner_id) or "No content"
                 except: pass
                 
                 emails_text_list.append(f"- [{e_time}] {e_dir}: {e_subj} - {str(e_content)[:200]}...")
@@ -481,7 +506,8 @@ class ZohoAgentCore:
         print(f"Fetched {len(emails)} emails total for {name}.")
         for i, e in enumerate(emails[:5]):
              e_dir = 'AGENT' if e.get('sent', True) else 'LEAD'
-             print(f"DEBUG Email {i}: [{e_dir}] | Time={e.get('sent_time', '')[:19]} | Subj={e.get('subject', 'N/A')}")
+             e_time = e.get("time") or e.get("sent_time") or ""
+             print(f"DEBUG Email {i}: [{e_dir}] | Time={e_time[:19]} | Subj={e.get('subject', 'N/A')}")
         print("-" * 20)
         print("="*40 + "\n")
         
@@ -511,6 +537,24 @@ class ZohoAgentCore:
             - Answer their questions directly
             - Do NOT send a generic drip or follow-up
             - Reference what they said
+            """
+        elif plan.get("template") == "day_2_followup_pending_question" and plan.get("context"):
+            ctx = plan["context"]
+            email_type_label = "FOLLOW_UP_PENDING_CLARIFICATION"
+            active_context = f"""
+            *** EMAIL TYPE: FOLLOW-UP ON PENDING CLARIFICATION ***
+            We already replied to the lead and asked for a corrected/confirmed date-time.
+            They have not answered that clarification yet.
+
+            OUR LAST SENT MESSAGE (what we are following up on):
+            Subject: {ctx.get('latest_sent_subject')}
+            Body: "{ctx.get('latest_sent_body')}"
+
+            TASK:
+            - Send a short, polite follow-up that references the pending clarification from our last email.
+            - Do NOT restart the conversation from the first outreach.
+            - Ask them to confirm the corrected date/time slot for the demo.
+            - Keep it concise and context-aware.
             """
         elif plan.get("template") in ["day_2_followup", "day_7_followup", "day_14_value_add", "day_28_check_in", "day_35_bump"]:
             email_type_label = "FOLLOW_UP_NO_RESPONSE"
@@ -558,12 +602,19 @@ class ZohoAgentCore:
             active_context=active_context,
             email_type=email_type_label
         )
+
+        # Safety rule: don't treat impossible date/time values from lead messages as confirmed.
+        prompt += (
+            "\n\nDATE/TIME VALIDATION RULE:\n"
+            "- If the lead suggests an impossible date/time (e.g., Feb 29 on a non-leap year, hour > 23),\n"
+            "  do NOT confirm it as valid. Politely ask for a corrected slot and optionally suggest valid alternatives.\n"
+        )
         
         if feedback:
             prompt += f"\nREFINE BASED ON FEEDBACK: {feedback}"
 
         # Configuration
-        model_name = "claude-3-5-haiku-20241022" # Using Claude 3.5 Haiku as requested (release 2024-10-22)
+        model_name = ANTHROPIC_MODEL
         
         # DEBUG LOG
         print("\n" + "="*40)
@@ -833,7 +884,7 @@ class ZohoAgentCore:
         """
         
         try:
-            model_name = "claude-3-5-haiku-20241022"
+            model_name = ANTHROPIC_MODEL
             message = self.client.messages.create(
                 model=model_name,
                 max_tokens=200,
